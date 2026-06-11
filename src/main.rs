@@ -38,6 +38,10 @@ struct Args {
     /// Output WAV file path (default: recording_<timestamp>.wav)
     #[arg(long)]
     output_file: Option<String>,
+
+    /// Treat input as mono (take channel 1 only, output to both L+R)
+    #[arg(long)]
+    mono: bool,
 }
 
 fn main() -> Result<()> {
@@ -68,24 +72,42 @@ fn main() -> Result<()> {
 
     let in_channels = input_config.channels as usize;
     let out_channels = output_config.channels as usize;
+    let mono = args.mono;
+    let actual_sample_rate = input_config.sample_rate.0;
 
     println!("\nStream config:");
     println!(
-        "  Input:  {} ch, {} Hz, buffer {}",
-        in_channels, input_config.sample_rate.0, args.buffer_size
+        "  Input:  {} ch{}, {} Hz, buffer {}",
+        in_channels,
+        if mono { " (mono → both L+R)" } else { "" },
+        input_config.sample_rate.0,
+        args.buffer_size
     );
     println!(
         "  Output: {} ch, {} Hz, buffer {}",
         out_channels, output_config.sample_rate.0, args.buffer_size
     );
 
+    // Ring buffers carry mono (1 ch) when --mono, otherwise all input channels.
+    let ring_channels = if mono { 1 } else { in_channels };
+
     // --- Ring buffer for passthrough ---
-    let ring_capacity = (args.buffer_size as usize) * in_channels * 4;
+    // Enough capacity for ~0.5s of audio to absorb scheduling jitter between
+    // input and output callbacks, especially around stream startup.
+    let ring_capacity = (args.sample_rate as usize) * ring_channels / 2;
     let (mut passthrough_producer, mut consumer) = RingBuffer::<f32>::new(ring_capacity);
+
+    // Pre-fill passthrough buffer with silence so the output callback has
+    // something to read immediately, preventing it from falling behind.
+    let prefill = (args.buffer_size as usize) * ring_channels * 2;
+    {
+        let chunk = passthrough_producer.write_chunk_uninit(prefill).unwrap();
+        chunk.fill_from_iter(std::iter::repeat(0.0f32).take(prefill));
+    }
 
     // --- Recording ring buffer (only if recording) ---
     let (mut rec_producer, rec_consumer) = if args.record {
-        let rec_capacity = (args.buffer_size as usize) * in_channels * 8;
+        let rec_capacity = (args.sample_rate as usize) * ring_channels;
         let (prod, cons) = RingBuffer::<f32>::new(rec_capacity);
         (Some(prod), Some(cons))
     } else {
@@ -106,31 +128,69 @@ fn main() -> Result<()> {
     let input_stream = input_device.build_input_stream(
         &input_config,
         move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-            // Push to passthrough ring buffer
-            let to_write = data.len().min(passthrough_producer.slots());
-            if to_write < data.len() {
-                eprintln!(
-                    "[WARN] Passthrough ring buffer overflow — dropped {} samples",
-                    data.len() - to_write
-                );
-            }
-            if to_write > 0 {
-                let chunk = passthrough_producer.write_chunk_uninit(to_write).unwrap();
-                chunk.fill_from_iter(data[..to_write].iter().copied());
-            }
+            if mono {
+                // Extract channel 0 from interleaved frames
+                let frame_count = data.len() / in_channels;
 
-            // Push to recording ring buffer
-            if let Some(ref mut rec_prod) = rec_producer {
-                let to_write_rec = data.len().min(rec_prod.slots());
-                if to_write_rec < data.len() {
+                let slots = passthrough_producer.slots();
+                let to_write = frame_count.min(slots);
+                if to_write < frame_count {
                     eprintln!(
-                        "[WARN] Recording ring buffer overflow — dropped {} samples",
-                        data.len() - to_write_rec
+                        "[WARN] Passthrough ring buffer overflow — dropped {} frames",
+                        frame_count - to_write
                     );
                 }
-                if to_write_rec > 0 {
-                    let chunk = rec_prod.write_chunk_uninit(to_write_rec).unwrap();
-                    chunk.fill_from_iter(data[..to_write_rec].iter().copied());
+                if to_write > 0 {
+                    let chunk = passthrough_producer.write_chunk_uninit(to_write).unwrap();
+                    chunk.fill_from_iter(
+                        data.chunks_exact(in_channels).take(to_write).map(|f| f[0]),
+                    );
+                }
+
+                if let Some(ref mut rec_prod) = rec_producer {
+                    let slots = rec_prod.slots();
+                    let to_write_rec = frame_count.min(slots);
+                    if to_write_rec < frame_count {
+                        eprintln!(
+                            "[WARN] Recording ring buffer overflow — dropped {} frames",
+                            frame_count - to_write_rec
+                        );
+                    }
+                    if to_write_rec > 0 {
+                        let chunk = rec_prod.write_chunk_uninit(to_write_rec).unwrap();
+                        chunk.fill_from_iter(
+                            data.chunks_exact(in_channels)
+                                .take(to_write_rec)
+                                .map(|f| f[0]),
+                        );
+                    }
+                }
+            } else {
+                // Pass all interleaved samples through
+                let to_write = data.len().min(passthrough_producer.slots());
+                if to_write < data.len() {
+                    eprintln!(
+                        "[WARN] Passthrough ring buffer overflow — dropped {} samples",
+                        data.len() - to_write
+                    );
+                }
+                if to_write > 0 {
+                    let chunk = passthrough_producer.write_chunk_uninit(to_write).unwrap();
+                    chunk.fill_from_iter(data[..to_write].iter().copied());
+                }
+
+                if let Some(ref mut rec_prod) = rec_producer {
+                    let to_write_rec = data.len().min(rec_prod.slots());
+                    if to_write_rec < data.len() {
+                        eprintln!(
+                            "[WARN] Recording ring buffer overflow — dropped {} samples",
+                            data.len() - to_write_rec
+                        );
+                    }
+                    if to_write_rec > 0 {
+                        let chunk = rec_prod.write_chunk_uninit(to_write_rec).unwrap();
+                        chunk.fill_from_iter(data[..to_write_rec].iter().copied());
+                    }
                 }
             }
         },
@@ -144,7 +204,26 @@ fn main() -> Result<()> {
         move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
             let available = consumer.slots();
 
-            if in_channels == out_channels {
+            if mono {
+                // Ring buffer has mono samples — duplicate to all output channels
+                let frames_needed = data.len() / out_channels;
+                let to_read = frames_needed.min(available);
+                if to_read > 0 {
+                    let chunk = consumer.read_chunk(to_read).unwrap();
+                    let (slice_a, slice_b) = chunk.as_slices();
+                    let mut i = 0;
+                    for &sample in slice_a.iter().chain(slice_b.iter()) {
+                        for _ in 0..out_channels {
+                            data[i] = sample;
+                            i += 1;
+                        }
+                    }
+                    chunk.commit_all();
+                }
+                for sample in &mut data[to_read * out_channels..] {
+                    *sample = 0.0;
+                }
+            } else if in_channels == out_channels {
                 let to_read = data.len().min(available);
                 if to_read > 0 {
                     let chunk = consumer.read_chunk(to_read).unwrap();
@@ -206,8 +285,8 @@ fn main() -> Result<()> {
         });
 
         let spec = hound::WavSpec {
-            channels: in_channels as u16,
-            sample_rate: args.sample_rate,
+            channels: ring_channels as u16,
+            sample_rate: actual_sample_rate,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
         };
@@ -238,9 +317,9 @@ fn main() -> Result<()> {
         None
     };
 
-    // --- Start streaming ---
-    input_stream.play()?;
+    // --- Start streaming (output first so consumer is ready) ---
     output_stream.play()?;
+    input_stream.play()?;
 
     println!("\n=== PASSTHROUGH ACTIVE ===");
     if args.record {
@@ -260,8 +339,8 @@ fn main() -> Result<()> {
     if let Some((handle, path)) = writer_handle {
         match handle.join() {
             Ok(Ok(total_samples)) => {
-                let total_frames = total_samples / in_channels as u64;
-                let duration_secs = total_frames as f64 / args.sample_rate as f64;
+                let total_frames = total_samples / ring_channels as u64;
+                let duration_secs = total_frames as f64 / actual_sample_rate as f64;
                 println!(
                     "Saved {} ({:.1}s, {} samples)",
                     path, duration_secs, total_samples
