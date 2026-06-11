@@ -1,0 +1,12 @@
+[package]
+name = "audiobox-studio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cpal = "0.15"
+rtrb = "0.3"              # lock-free ring buffer (real-time safe)
+anyhow = "1"              # ergonomic error handling
+clap = { version = "4", features = ["derive"] }  # CLI args for device selection
+ctrlc = "3"               # graceful shutdown on Ctrl+C
+hound = "3.5"             # WAV file read/write
