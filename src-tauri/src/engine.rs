@@ -24,12 +24,21 @@ pub struct DeviceConfigInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelMode {
+    Ch1,
+    Ch2,
+    Both,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioEngineConfig {
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub sample_rate: u32,
     pub buffer_size: u32,
-    pub mono: bool,
+    pub channel_mode: ChannelMode,
+    pub merge_to_mono: bool,
 }
 
 impl Default for AudioEngineConfig {
@@ -39,7 +48,8 @@ impl Default for AudioEngineConfig {
             output_device: None,
             sample_rate: 48000,
             buffer_size: 256,
-            mono: false,
+            channel_mode: ChannelMode::Both,
+            merge_to_mono: false,
         }
     }
 }
@@ -138,7 +148,7 @@ struct AudioEngine {
     writer_handle: Option<std::thread::JoinHandle<Result<u64>>>,
     recording_path: Option<String>,
     actual_sample_rate: u32,
-    ring_channels: usize,
+    rec_channels: usize,
 }
 
 impl AudioEngine {
@@ -212,22 +222,30 @@ impl AudioEngine {
 
         let in_channels = input_config.channels as usize;
         let out_channels = output_config.channels as usize;
-        let mono = config.mono;
         let actual_sample_rate = input_config.sample_rate.0;
-        let ring_channels = if mono { 1 } else { in_channels };
+
+        let source_channel: Option<usize> = match config.channel_mode {
+            ChannelMode::Ch1 => Some(0),
+            ChannelMode::Ch2 => Some((1).min(in_channels - 1)),
+            ChannelMode::Both => None,
+        };
+        let merge = source_channel.is_none() && config.merge_to_mono;
+        let passthrough_mono = source_channel.is_some() || merge;
+        let passthrough_channels = if passthrough_mono { 1 } else { in_channels };
+        let rec_channels = if source_channel.is_some() || merge { 1 } else { in_channels };
 
         // --- Passthrough ring buffer (~0.5s capacity) ---
-        let ring_capacity = (actual_sample_rate as usize) * ring_channels / 2;
+        let ring_capacity = (actual_sample_rate as usize) * passthrough_channels / 2;
         let (mut passthrough_producer, mut consumer) = RingBuffer::<f32>::new(ring_capacity);
 
-        let prefill = (config.buffer_size as usize) * ring_channels;
+        let prefill = (config.buffer_size as usize) * passthrough_channels;
         {
             let chunk = passthrough_producer.write_chunk_uninit(prefill).unwrap();
             chunk.fill_from_iter(std::iter::repeat(0.0f32).take(prefill));
         }
 
         // --- Recording ring buffer (always allocated, gated by is_recording) ---
-        let rec_capacity = (actual_sample_rate as usize) * ring_channels;
+        let rec_capacity = (actual_sample_rate as usize) * rec_channels;
         let (mut rec_producer, rec_consumer) = RingBuffer::<f32>::new(rec_capacity);
 
         let running = Arc::new(AtomicBool::new(true));
@@ -238,21 +256,22 @@ impl AudioEngine {
         let input_stream = input_device.build_input_stream(
             &input_config,
             move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-                if mono {
-                    let frame_count = data.len() / in_channels;
+                let frame_count = data.len() / in_channels;
 
+                if let Some(ch) = source_channel {
+                    // Single channel (Ch1 or Ch2): extract one channel for both rings
                     let slots = passthrough_producer.slots();
                     let to_write = frame_count.min(slots);
                     if to_write < frame_count {
                         eprintln!(
-                            "[WARN] Passthrough ring buffer overflow — dropped {} frames",
+                            "[WARN] Passthrough ring overflow — dropped {} frames",
                             frame_count - to_write
                         );
                     }
                     if to_write > 0 {
                         let chunk = passthrough_producer.write_chunk_uninit(to_write).unwrap();
                         chunk.fill_from_iter(
-                            data.chunks_exact(in_channels).take(to_write).map(|f| f[0]),
+                            data.chunks_exact(in_channels).take(to_write).map(|f| f[ch]),
                         );
                     }
 
@@ -261,7 +280,7 @@ impl AudioEngine {
                         let to_write_rec = frame_count.min(slots);
                         if to_write_rec < frame_count {
                             eprintln!(
-                                "[WARN] Recording ring buffer overflow — dropped {} frames",
+                                "[WARN] Recording ring overflow — dropped {} frames",
                                 frame_count - to_write_rec
                             );
                         }
@@ -270,15 +289,55 @@ impl AudioEngine {
                             chunk.fill_from_iter(
                                 data.chunks_exact(in_channels)
                                     .take(to_write_rec)
-                                    .map(|f| f[0]),
+                                    .map(|f| f[ch]),
+                            );
+                        }
+                    }
+                } else if merge {
+                    // Both + merge: mono average for both passthrough and recording
+                    let inv = 1.0 / in_channels as f32;
+
+                    let slots = passthrough_producer.slots();
+                    let to_write = frame_count.min(slots);
+                    if to_write < frame_count {
+                        eprintln!(
+                            "[WARN] Passthrough ring overflow — dropped {} frames",
+                            frame_count - to_write
+                        );
+                    }
+                    if to_write > 0 {
+                        let chunk = passthrough_producer.write_chunk_uninit(to_write).unwrap();
+                        chunk.fill_from_iter(
+                            data.chunks_exact(in_channels)
+                                .take(to_write)
+                                .map(|f| f.iter().sum::<f32>() * inv),
+                        );
+                    }
+
+                    if is_recording_cb.load(Ordering::Relaxed) {
+                        let slots = rec_producer.slots();
+                        let to_write_rec = frame_count.min(slots);
+                        if to_write_rec < frame_count {
+                            eprintln!(
+                                "[WARN] Recording ring overflow — dropped {} frames",
+                                frame_count - to_write_rec
+                            );
+                        }
+                        if to_write_rec > 0 {
+                            let chunk = rec_producer.write_chunk_uninit(to_write_rec).unwrap();
+                            chunk.fill_from_iter(
+                                data.chunks_exact(in_channels)
+                                    .take(to_write_rec)
+                                    .map(|f| f.iter().sum::<f32>() * inv),
                             );
                         }
                     }
                 } else {
+                    // Both stereo: same data to both rings
                     let to_write = data.len().min(passthrough_producer.slots());
                     if to_write < data.len() {
                         eprintln!(
-                            "[WARN] Passthrough ring buffer overflow — dropped {} samples",
+                            "[WARN] Passthrough ring overflow — dropped {} samples",
                             data.len() - to_write
                         );
                     }
@@ -291,7 +350,7 @@ impl AudioEngine {
                         let to_write_rec = data.len().min(rec_producer.slots());
                         if to_write_rec < data.len() {
                             eprintln!(
-                                "[WARN] Recording ring buffer overflow — dropped {} samples",
+                                "[WARN] Recording ring overflow — dropped {} samples",
                                 data.len() - to_write_rec
                             );
                         }
@@ -312,7 +371,7 @@ impl AudioEngine {
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                 let available = consumer.slots();
 
-                if mono {
+                if passthrough_mono {
                     let frames_needed = data.len() / out_channels;
                     let to_read = frames_needed.min(available);
                     if to_read > 0 {
@@ -396,7 +455,7 @@ impl AudioEngine {
             writer_handle: None,
             recording_path: None,
             actual_sample_rate,
-            ring_channels,
+            rec_channels,
         })
     }
 
@@ -419,7 +478,7 @@ impl AudioEngine {
         });
 
         let spec = hound::WavSpec {
-            channels: self.ring_channels as u16,
+            channels: self.rec_channels as u16,
             sample_rate: self.actual_sample_rate,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
@@ -463,7 +522,7 @@ impl AudioEngine {
             let path = self.recording_path.take().unwrap_or_default();
             match handle.join() {
                 Ok(Ok(total_samples)) => {
-                    let total_frames = total_samples / self.ring_channels as u64;
+                    let total_frames = total_samples / self.rec_channels as u64;
                     let duration_secs = total_frames as f64 / self.actual_sample_rate as f64;
                     Ok(Some(RecordingResult {
                         path,

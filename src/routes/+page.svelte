@@ -29,7 +29,8 @@
   let selectedOutput: string = $state('');
   let sampleRate: number = $state(48000);
   let bufferSize: number = $state(256);
-  let mono: boolean = $state(false);
+  let channelMode: string = $state('both');
+  let mergeToMono: boolean = $state(false);
 
   let engineRunning: boolean = $state(false);
   let recording: boolean = $state(false);
@@ -75,7 +76,8 @@
           output_device: selectedOutput || null,
           sample_rate: sampleRate,
           buffer_size: bufferSize,
-          mono
+          channel_mode: channelMode,
+          merge_to_mono: channelMode === 'both' && mergeToMono
         }
       });
       engineRunning = true;
@@ -161,12 +163,35 @@
       </select>
     </div>
 
-    <div class="field checkbox">
-      <label>
-        <input type="checkbox" bind:checked={mono} disabled={engineRunning} />
-        Mono (input 1 → both L+R)
-      </label>
+    <div class="field">
+      <label>Channels</label>
+      <div class="channel-toggle">
+        <button
+          class="ch-btn" class:active={channelMode === 'ch1'}
+          disabled={engineRunning}
+          onclick={() => channelMode = 'ch1'}
+        >Ch 1</button>
+        <button
+          class="ch-btn" class:active={channelMode === 'both'}
+          disabled={engineRunning}
+          onclick={() => channelMode = 'both'}
+        >Both</button>
+        <button
+          class="ch-btn" class:active={channelMode === 'ch2'}
+          disabled={engineRunning}
+          onclick={() => channelMode = 'ch2'}
+        >Ch 2</button>
+      </div>
     </div>
+
+    {#if channelMode === 'both'}
+      <div class="field checkbox">
+        <label>
+          <input type="checkbox" bind:checked={mergeToMono} disabled={engineRunning} />
+          Merge to mono (both channels in both ears)
+        </label>
+      </div>
+    {/if}
   </section>
 
   <section class="transport">
@@ -260,6 +285,40 @@
     opacity: 0.5;
   }
 
+  .channel-toggle {
+    display: flex;
+    gap: 0;
+    border-radius: 4px;
+    overflow: hidden;
+    border: 1px solid #333;
+  }
+
+  .ch-btn {
+    flex: 1;
+    padding: 0.5rem 0;
+    background: #16213e;
+    color: #888;
+    border: none;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+
+  .ch-btn:not(:last-child) {
+    border-right: 1px solid #333;
+  }
+
+  .ch-btn.active {
+    background: #e94560;
+    color: #fff;
+  }
+
+  .ch-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
   .checkbox label {
     display: flex;
     align-items: center;
@@ -268,7 +327,7 @@
     color: #e0e0e0;
     text-transform: none;
     cursor: pointer;
-    padding-top: 1.1rem;
+    padding-top: 0.5rem;
   }
 
   input[type="checkbox"] {
