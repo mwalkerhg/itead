@@ -21,6 +21,13 @@
     total_samples: number;
   }
 
+  interface ChannelStripParams {
+    gain_db: number;
+    lowcut_enabled: boolean;
+    lowcut_freq_hz: number;
+    phase_invert: boolean;
+  }
+
   const STANDARD_RATES = [44100, 48000, 88200, 96000, 176400, 192000];
 
   let inputDevices: DeviceInfo[] = $state([]);
@@ -31,6 +38,13 @@
   let bufferSize: number = $state(256);
   let channelMode: string = $state('both');
   let mergeToMono: boolean = $state(false);
+
+  let ch1Params: ChannelStripParams = $state({
+    gain_db: 0, lowcut_enabled: false, lowcut_freq_hz: 80, phase_invert: false
+  });
+  let ch2Params: ChannelStripParams = $state({
+    gain_db: 0, lowcut_enabled: false, lowcut_freq_hz: 80, phase_invert: false
+  });
 
   let engineRunning: boolean = $state(false);
   let recording: boolean = $state(false);
@@ -67,6 +81,31 @@
     }
   });
 
+  let ch1Timer: ReturnType<typeof setTimeout> | null = null;
+  let ch2Timer: ReturnType<typeof setTimeout> | null = null;
+
+  function sendChannelParams(channel: number, params: ChannelStripParams) {
+    invoke('update_channel_params', { channel, params }).catch(e => {
+      console.error(`Failed to update ch${channel + 1} params:`, e);
+    });
+  }
+
+  $effect(() => {
+    if (engineRunning) {
+      const p = { ...ch1Params };
+      if (ch1Timer) clearTimeout(ch1Timer);
+      ch1Timer = setTimeout(() => sendChannelParams(0, p), 16);
+    }
+  });
+
+  $effect(() => {
+    if (engineRunning) {
+      const p = { ...ch2Params };
+      if (ch2Timer) clearTimeout(ch2Timer);
+      ch2Timer = setTimeout(() => sendChannelParams(1, p), 16);
+    }
+  });
+
   async function startEngine() {
     try {
       error = '';
@@ -82,6 +121,8 @@
       });
       engineRunning = true;
       status = 'Passthrough active';
+      sendChannelParams(0, { ...ch1Params });
+      sendChannelParams(1, { ...ch2Params });
     } catch (e) {
       error = `${e}`;
     }
@@ -190,6 +231,60 @@
           <input type="checkbox" bind:checked={mergeToMono} disabled={engineRunning} />
           Merge to mono (both channels in both ears)
         </label>
+      </div>
+    {/if}
+  </section>
+
+  <section class="channel-strips">
+    {#if channelMode !== 'ch2'}
+      <div class="strip">
+        <h3>Ch 1</h3>
+        <div class="strip-control">
+          <label>Gain: {ch1Params.gain_db.toFixed(1)} dB</label>
+          <input type="range" min={-60} max={12} step={0.1} bind:value={ch1Params.gain_db} />
+        </div>
+        <div class="strip-control">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={ch1Params.lowcut_enabled} />
+            Low Cut
+          </label>
+          {#if ch1Params.lowcut_enabled}
+            <label>{ch1Params.lowcut_freq_hz.toFixed(0)} Hz</label>
+            <input type="range" min={20} max={500} step={1} bind:value={ch1Params.lowcut_freq_hz} />
+          {/if}
+        </div>
+        <div class="strip-control">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={ch1Params.phase_invert} />
+            &#x2300; Phase Invert
+          </label>
+        </div>
+      </div>
+    {/if}
+
+    {#if channelMode !== 'ch1'}
+      <div class="strip">
+        <h3>Ch 2</h3>
+        <div class="strip-control">
+          <label>Gain: {ch2Params.gain_db.toFixed(1)} dB</label>
+          <input type="range" min={-60} max={12} step={0.1} bind:value={ch2Params.gain_db} />
+        </div>
+        <div class="strip-control">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={ch2Params.lowcut_enabled} />
+            Low Cut
+          </label>
+          {#if ch2Params.lowcut_enabled}
+            <label>{ch2Params.lowcut_freq_hz.toFixed(0)} Hz</label>
+            <input type="range" min={20} max={500} step={1} bind:value={ch2Params.lowcut_freq_hz} />
+          {/if}
+        </div>
+        <div class="strip-control">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={ch2Params.phase_invert} />
+            &#x2300; Phase Invert
+          </label>
+        </div>
       </div>
     {/if}
   </section>
@@ -334,6 +429,52 @@
     accent-color: #e94560;
     width: 16px;
     height: 16px;
+  }
+
+  .channel-strips {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .strip {
+    flex: 1;
+    background: #16213e;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 1rem;
+  }
+
+  .strip h3 {
+    margin: 0 0 0.75rem;
+    font-size: 0.9rem;
+    color: #e94560;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .strip-control {
+    margin-bottom: 0.75rem;
+  }
+
+  .strip-control:last-child {
+    margin-bottom: 0;
+  }
+
+  .strip-control input[type="range"] {
+    width: 100%;
+    accent-color: #e94560;
+    margin-top: 0.25rem;
+  }
+
+  .strip-control .toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+    color: #e0e0e0;
+    text-transform: none;
+    cursor: pointer;
   }
 
   .transport {

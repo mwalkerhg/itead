@@ -1,6 +1,6 @@
 pub mod engine;
 
-use engine::{AudioEngineConfig, DeviceInfo, EngineHandle, RecordingResult};
+use engine::{AudioEngineConfig, ChannelStripParams, DeviceInfo, EngineHandle, RecordingResult};
 use std::sync::Mutex;
 use tauri::State;
 
@@ -36,6 +36,18 @@ fn start_recording(
 }
 
 #[tauri::command]
+fn update_channel_params(
+    state: State<'_, EngineState>,
+    channel: u8,
+    params: ChannelStripParams,
+) -> Result<(), String> {
+    let guard = state.0.lock().map_err(|e| e.to_string())?;
+    let handle = guard.as_ref().ok_or("Engine not running")?;
+    handle.update_channel_params(channel, &params);
+    Ok(())
+}
+
+#[tauri::command]
 fn stop_engine(state: State<'_, EngineState>) -> Result<Option<RecordingResult>, String> {
     let mut guard = state.0.lock().map_err(|e| e.to_string())?;
     let handle = guard.take().ok_or("Engine not running")?;
@@ -51,6 +63,7 @@ pub fn run() {
             start_engine,
             start_recording,
             stop_engine,
+            update_channel_params,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

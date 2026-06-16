@@ -3,7 +3,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, StreamConfig};
 use rtrb::RingBuffer;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -55,6 +55,118 @@ impl Default for AudioEngineConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelStripParams {
+    pub gain_db: f32,
+    pub lowcut_enabled: bool,
+    pub lowcut_freq_hz: f32,
+    pub phase_invert: bool,
+}
+
+impl Default for ChannelStripParams {
+    fn default() -> Self {
+        Self {
+            gain_db: 0.0,
+            lowcut_enabled: false,
+            lowcut_freq_hz: 80.0,
+            phase_invert: false,
+        }
+    }
+}
+
+struct AtomicChannelStrip {
+    gain_db: AtomicU32,
+    lowcut_enabled: AtomicBool,
+    lowcut_freq_hz: AtomicU32,
+    phase_invert: AtomicBool,
+}
+
+impl AtomicChannelStrip {
+    fn new() -> Self {
+        Self {
+            gain_db: AtomicU32::new(0.0f32.to_bits()),
+            lowcut_enabled: AtomicBool::new(false),
+            lowcut_freq_hz: AtomicU32::new(80.0f32.to_bits()),
+            phase_invert: AtomicBool::new(false),
+        }
+    }
+
+    fn load_gain_db(&self) -> f32 {
+        f32::from_bits(self.gain_db.load(Ordering::Relaxed))
+    }
+
+    fn load_lowcut_freq(&self) -> f32 {
+        f32::from_bits(self.lowcut_freq_hz.load(Ordering::Relaxed))
+    }
+}
+
+pub struct SharedChannelParams {
+    strips: [AtomicChannelStrip; 2],
+}
+
+impl SharedChannelParams {
+    pub fn new() -> Self {
+        Self {
+            strips: [AtomicChannelStrip::new(), AtomicChannelStrip::new()],
+        }
+    }
+}
+
+struct BiquadState {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32,
+    z2: f32,
+    last_freq: f32,
+    last_sample_rate: f32,
+}
+
+impl BiquadState {
+    fn new() -> Self {
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            z1: 0.0,
+            z2: 0.0,
+            last_freq: 0.0,
+            last_sample_rate: 0.0,
+        }
+    }
+
+    fn update_highpass(&mut self, freq_hz: f32, sample_rate: f32) {
+        if freq_hz == self.last_freq && sample_rate == self.last_sample_rate {
+            return;
+        }
+        self.last_freq = freq_hz;
+        self.last_sample_rate = sample_rate;
+
+        let w0 = 2.0 * std::f32::consts::PI * freq_hz / sample_rate;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let alpha = sin_w0 / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
+
+        let a0 = 1.0 + alpha;
+        self.b0 = ((1.0 + cos_w0) / 2.0) / a0;
+        self.b1 = (-(1.0 + cos_w0)) / a0;
+        self.b2 = ((1.0 + cos_w0) / 2.0) / a0;
+        self.a1 = (-2.0 * cos_w0) / a0;
+        self.a2 = (1.0 - alpha) / a0;
+    }
+
+    fn process(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        y
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordingResult {
     pub path: String,
     pub duration_secs: f64,
@@ -73,6 +185,7 @@ enum EngineCmd {
 
 pub struct EngineHandle {
     cmd_tx: mpsc::Sender<EngineCmd>,
+    channel_params: Arc<SharedChannelParams>,
 }
 
 impl EngineHandle {
@@ -80,10 +193,13 @@ impl EngineHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (init_tx, init_rx) = mpsc::sync_channel::<Result<()>>(1);
 
+        let channel_params = Arc::new(SharedChannelParams::new());
+        let params_for_engine = channel_params.clone();
+
         std::thread::Builder::new()
             .name("audio-engine".into())
             .spawn(move || {
-                let mut engine = match AudioEngine::new(config) {
+                let mut engine = match AudioEngine::new(config, params_for_engine) {
                     Ok(e) => {
                         init_tx.send(Ok(())).ok();
                         e
@@ -108,7 +224,7 @@ impl EngineHandle {
             })?;
 
         init_rx.recv().map_err(|_| anyhow!("Engine thread died during init"))??;
-        Ok(Self { cmd_tx })
+        Ok(Self { cmd_tx, channel_params })
     }
 
     pub fn start_recording(&self, path: Option<String>) -> Result<String> {
@@ -132,6 +248,15 @@ impl EngineHandle {
         reply_rx
             .recv()
             .map_err(|_| anyhow!("Engine thread died"))?
+    }
+
+    pub fn update_channel_params(&self, channel: u8, params: &ChannelStripParams) {
+        let idx = (channel as usize).min(1);
+        let strip = &self.channel_params.strips[idx];
+        strip.gain_db.store(params.gain_db.to_bits(), Ordering::Relaxed);
+        strip.lowcut_enabled.store(params.lowcut_enabled, Ordering::Relaxed);
+        strip.lowcut_freq_hz.store(params.lowcut_freq_hz.to_bits(), Ordering::Relaxed);
+        strip.phase_invert.store(params.phase_invert, Ordering::Relaxed);
     }
 
     pub fn list_devices() -> Result<(Vec<DeviceInfo>, Vec<DeviceInfo>)> {
@@ -209,7 +334,7 @@ impl AudioEngine {
         Ok((inputs, outputs))
     }
 
-    pub fn new(config: AudioEngineConfig) -> Result<Self> {
+    pub fn new(config: AudioEngineConfig, channel_params: Arc<SharedChannelParams>) -> Result<Self> {
         let host = cpal::default_host();
 
         let input_device = select_device(&host, &config.input_device, true)?;
@@ -252,112 +377,108 @@ impl AudioEngine {
         let is_recording = Arc::new(AtomicBool::new(false));
         let is_recording_cb = is_recording.clone();
 
+        let params_cb = channel_params.clone();
+        let sample_rate_f = actual_sample_rate as f32;
+        let mut biquad = [BiquadState::new(), BiquadState::new()];
+        let mut process_buf: Vec<f32> =
+            Vec::with_capacity(config.buffer_size as usize * in_channels);
+
         // --- Input stream ---
         let input_stream = input_device.build_input_stream(
             &input_config,
             move |data: &[f32], _info: &cpal::InputCallbackInfo| {
                 let frame_count = data.len() / in_channels;
 
-                if let Some(ch) = source_channel {
-                    // Single channel (Ch1 or Ch2): extract one channel for both rings
-                    let slots = passthrough_producer.slots();
-                    let to_write = frame_count.min(slots);
-                    if to_write < frame_count {
-                        eprintln!(
-                            "[WARN] Passthrough ring overflow — dropped {} frames",
-                            frame_count - to_write
-                        );
+                // Load per-channel params once per buffer
+                struct StripSnapshot {
+                    phase: f32,
+                    lowcut_on: bool,
+                    lowcut_freq: f32,
+                    gain_lin: f32,
+                }
+                let snap = |idx: usize| -> StripSnapshot {
+                    let s = &params_cb.strips[idx];
+                    StripSnapshot {
+                        phase: if s.phase_invert.load(Ordering::Relaxed) { -1.0 } else { 1.0 },
+                        lowcut_on: s.lowcut_enabled.load(Ordering::Relaxed),
+                        lowcut_freq: s.load_lowcut_freq(),
+                        gain_lin: 10.0f32.powf(s.load_gain_db() / 20.0),
                     }
-                    if to_write > 0 {
-                        let chunk = passthrough_producer.write_chunk_uninit(to_write).unwrap();
-                        chunk.fill_from_iter(
-                            data.chunks_exact(in_channels).take(to_write).map(|f| f[ch]),
-                        );
-                    }
+                };
 
-                    if is_recording_cb.load(Ordering::Relaxed) {
-                        let slots = rec_producer.slots();
-                        let to_write_rec = frame_count.min(slots);
-                        if to_write_rec < frame_count {
-                            eprintln!(
-                                "[WARN] Recording ring overflow — dropped {} frames",
-                                frame_count - to_write_rec
-                            );
+                let apply_dsp =
+                    |sample: f32, snap: &StripSnapshot, bq: &mut BiquadState| -> f32 {
+                        let mut s = sample * snap.phase;
+                        if snap.lowcut_on {
+                            bq.update_highpass(snap.lowcut_freq, sample_rate_f);
+                            s = bq.process(s);
                         }
-                        if to_write_rec > 0 {
-                            let chunk = rec_producer.write_chunk_uninit(to_write_rec).unwrap();
-                            chunk.fill_from_iter(
-                                data.chunks_exact(in_channels)
-                                    .take(to_write_rec)
-                                    .map(|f| f[ch]),
-                            );
-                        }
+                        s * snap.gain_lin
+                    };
+
+                // Extract + process into pre-allocated buffer
+                process_buf.clear();
+
+                if let Some(ch) = source_channel {
+                    let p = snap(ch);
+                    for frame in data.chunks_exact(in_channels).take(frame_count) {
+                        process_buf.push(apply_dsp(frame[ch], &p, &mut biquad[ch]));
                     }
                 } else if merge {
-                    // Both + merge: mono average for both passthrough and recording
-                    let inv = 1.0 / in_channels as f32;
-
-                    let slots = passthrough_producer.slots();
-                    let to_write = frame_count.min(slots);
-                    if to_write < frame_count {
-                        eprintln!(
-                            "[WARN] Passthrough ring overflow — dropped {} frames",
-                            frame_count - to_write
-                        );
-                    }
-                    if to_write > 0 {
-                        let chunk = passthrough_producer.write_chunk_uninit(to_write).unwrap();
-                        chunk.fill_from_iter(
-                            data.chunks_exact(in_channels)
-                                .take(to_write)
-                                .map(|f| f.iter().sum::<f32>() * inv),
-                        );
-                    }
-
-                    if is_recording_cb.load(Ordering::Relaxed) {
-                        let slots = rec_producer.slots();
-                        let to_write_rec = frame_count.min(slots);
-                        if to_write_rec < frame_count {
-                            eprintln!(
-                                "[WARN] Recording ring overflow — dropped {} frames",
-                                frame_count - to_write_rec
-                            );
-                        }
-                        if to_write_rec > 0 {
-                            let chunk = rec_producer.write_chunk_uninit(to_write_rec).unwrap();
-                            chunk.fill_from_iter(
-                                data.chunks_exact(in_channels)
-                                    .take(to_write_rec)
-                                    .map(|f| f.iter().sum::<f32>() * inv),
-                            );
-                        }
+                    let p0 = snap(0);
+                    let p1 = snap(1);
+                    let inv = 1.0 / in_channels.min(2) as f32;
+                    for frame in data.chunks_exact(in_channels).take(frame_count) {
+                        let s0 = apply_dsp(frame[0], &p0, &mut biquad[0]);
+                        let s1 = if in_channels > 1 {
+                            apply_dsp(frame[1], &p1, &mut biquad[1])
+                        } else {
+                            s0
+                        };
+                        process_buf.push((s0 + s1) * inv);
                     }
                 } else {
-                    // Both stereo: same data to both rings
-                    let to_write = data.len().min(passthrough_producer.slots());
-                    if to_write < data.len() {
+                    let p0 = snap(0);
+                    let p1 = snap(1);
+                    for frame in data.chunks_exact(in_channels).take(frame_count) {
+                        process_buf.push(apply_dsp(frame[0], &p0, &mut biquad[0]));
+                        if in_channels > 1 {
+                            process_buf.push(apply_dsp(frame[1], &p1, &mut biquad[1]));
+                        }
+                        for ch_idx in 2..in_channels {
+                            process_buf.push(frame[ch_idx]);
+                        }
+                    }
+                }
+
+                // Write processed buffer to passthrough ring
+                let buf_len = process_buf.len();
+                let slots = passthrough_producer.slots();
+                let to_write = buf_len.min(slots);
+                if to_write < buf_len {
+                    eprintln!(
+                        "[WARN] Passthrough ring overflow — dropped {} samples",
+                        buf_len - to_write
+                    );
+                }
+                if to_write > 0 {
+                    let chunk = passthrough_producer.write_chunk_uninit(to_write).unwrap();
+                    chunk.fill_from_iter(process_buf[..to_write].iter().copied());
+                }
+
+                // Write processed buffer to recording ring
+                if is_recording_cb.load(Ordering::Relaxed) {
+                    let rec_slots = rec_producer.slots();
+                    let to_write_rec = buf_len.min(rec_slots);
+                    if to_write_rec < buf_len {
                         eprintln!(
-                            "[WARN] Passthrough ring overflow — dropped {} samples",
-                            data.len() - to_write
+                            "[WARN] Recording ring overflow — dropped {} samples",
+                            buf_len - to_write_rec
                         );
                     }
-                    if to_write > 0 {
-                        let chunk = passthrough_producer.write_chunk_uninit(to_write).unwrap();
-                        chunk.fill_from_iter(data[..to_write].iter().copied());
-                    }
-
-                    if is_recording_cb.load(Ordering::Relaxed) {
-                        let to_write_rec = data.len().min(rec_producer.slots());
-                        if to_write_rec < data.len() {
-                            eprintln!(
-                                "[WARN] Recording ring overflow — dropped {} samples",
-                                data.len() - to_write_rec
-                            );
-                        }
-                        if to_write_rec > 0 {
-                            let chunk = rec_producer.write_chunk_uninit(to_write_rec).unwrap();
-                            chunk.fill_from_iter(data[..to_write_rec].iter().copied());
-                        }
+                    if to_write_rec > 0 {
+                        let chunk = rec_producer.write_chunk_uninit(to_write_rec).unwrap();
+                        chunk.fill_from_iter(process_buf[..to_write_rec].iter().copied());
                     }
                 }
             },
