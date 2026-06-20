@@ -60,6 +60,10 @@ pub struct ChannelStripParams {
     pub lowcut_enabled: bool,
     pub lowcut_freq_hz: f32,
     pub phase_invert: bool,
+    pub reverb_enabled: bool,
+    pub reverb_room_size: f32,
+    pub reverb_damping: f32,
+    pub reverb_wet: f32,
 }
 
 impl Default for ChannelStripParams {
@@ -69,6 +73,10 @@ impl Default for ChannelStripParams {
             lowcut_enabled: false,
             lowcut_freq_hz: 80.0,
             phase_invert: false,
+            reverb_enabled: false,
+            reverb_room_size: 0.5,
+            reverb_damping: 0.5,
+            reverb_wet: 0.3,
         }
     }
 }
@@ -78,6 +86,10 @@ struct AtomicChannelStrip {
     lowcut_enabled: AtomicBool,
     lowcut_freq_hz: AtomicU32,
     phase_invert: AtomicBool,
+    reverb_enabled: AtomicBool,
+    reverb_room_size: AtomicU32,
+    reverb_damping: AtomicU32,
+    reverb_wet: AtomicU32,
 }
 
 impl AtomicChannelStrip {
@@ -87,6 +99,10 @@ impl AtomicChannelStrip {
             lowcut_enabled: AtomicBool::new(false),
             lowcut_freq_hz: AtomicU32::new(80.0f32.to_bits()),
             phase_invert: AtomicBool::new(false),
+            reverb_enabled: AtomicBool::new(false),
+            reverb_room_size: AtomicU32::new(0.5f32.to_bits()),
+            reverb_damping: AtomicU32::new(0.5f32.to_bits()),
+            reverb_wet: AtomicU32::new(0.3f32.to_bits()),
         }
     }
 
@@ -163,6 +179,131 @@ impl BiquadState {
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
         self.z2 = self.b2 * x - self.a2 * y;
         y
+    }
+}
+
+// ─── Freeverb ──────────────────────────────────────────────────────────
+
+const COMB_TUNINGS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+const ALLPASS_TUNINGS: [usize; 4] = [556, 441, 341, 225];
+const FREEVERB_GAIN: f32 = 0.015;
+const SCALE_ROOM: f32 = 0.28;
+const OFFSET_ROOM: f32 = 0.7;
+
+struct CombFilter {
+    buffer: Vec<f32>,
+    index: usize,
+    filterstore: f32,
+    feedback: f32,
+    damp1: f32,
+    damp2: f32,
+}
+
+impl CombFilter {
+    fn new(size: usize) -> Self {
+        Self {
+            buffer: vec![0.0; size],
+            index: 0,
+            filterstore: 0.0,
+            feedback: 0.0,
+            damp1: 0.0,
+            damp2: 1.0,
+        }
+    }
+
+    fn set_damp(&mut self, val: f32) {
+        self.damp1 = val;
+        self.damp2 = 1.0 - val;
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let output = self.buffer[self.index];
+        self.filterstore = output * self.damp2 + self.filterstore * self.damp1;
+        self.buffer[self.index] = input + self.filterstore * self.feedback;
+        self.index += 1;
+        if self.index >= self.buffer.len() {
+            self.index = 0;
+        }
+        output
+    }
+}
+
+struct AllpassFilter {
+    buffer: Vec<f32>,
+    index: usize,
+}
+
+impl AllpassFilter {
+    fn new(size: usize) -> Self {
+        Self {
+            buffer: vec![0.0; size],
+            index: 0,
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let buffered = self.buffer[self.index];
+        let output = -input + buffered;
+        self.buffer[self.index] = input + buffered * 0.5;
+        self.index += 1;
+        if self.index >= self.buffer.len() {
+            self.index = 0;
+        }
+        output
+    }
+}
+
+struct Freeverb {
+    combs: Vec<CombFilter>,
+    allpasses: Vec<AllpassFilter>,
+    last_room_size: f32,
+    last_damping: f32,
+}
+
+impl Freeverb {
+    fn new(sample_rate: f32) -> Self {
+        let scale = sample_rate / 44100.0;
+        let combs = COMB_TUNINGS
+            .iter()
+            .map(|&t| CombFilter::new(((t as f32) * scale) as usize))
+            .collect();
+        let allpasses = ALLPASS_TUNINGS
+            .iter()
+            .map(|&t| AllpassFilter::new(((t as f32) * scale) as usize))
+            .collect();
+        let mut rv = Self {
+            combs,
+            allpasses,
+            last_room_size: -1.0,
+            last_damping: -1.0,
+        };
+        rv.set_params(0.5, 0.5);
+        rv
+    }
+
+    fn set_params(&mut self, room_size: f32, damping: f32) {
+        if room_size == self.last_room_size && damping == self.last_damping {
+            return;
+        }
+        self.last_room_size = room_size;
+        self.last_damping = damping;
+        let feedback = room_size * SCALE_ROOM + OFFSET_ROOM;
+        for comb in &mut self.combs {
+            comb.feedback = feedback;
+            comb.set_damp(damping);
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let input_scaled = input * FREEVERB_GAIN;
+        let mut out = 0.0;
+        for comb in &mut self.combs {
+            out += comb.process(input_scaled);
+        }
+        for allpass in &mut self.allpasses {
+            out = allpass.process(out);
+        }
+        out
     }
 }
 
@@ -257,6 +398,10 @@ impl EngineHandle {
         strip.lowcut_enabled.store(params.lowcut_enabled, Ordering::Relaxed);
         strip.lowcut_freq_hz.store(params.lowcut_freq_hz.to_bits(), Ordering::Relaxed);
         strip.phase_invert.store(params.phase_invert, Ordering::Relaxed);
+        strip.reverb_enabled.store(params.reverb_enabled, Ordering::Relaxed);
+        strip.reverb_room_size.store(params.reverb_room_size.to_bits(), Ordering::Relaxed);
+        strip.reverb_damping.store(params.reverb_damping.to_bits(), Ordering::Relaxed);
+        strip.reverb_wet.store(params.reverb_wet.to_bits(), Ordering::Relaxed);
     }
 
     pub fn list_devices() -> Result<(Vec<DeviceInfo>, Vec<DeviceInfo>)> {
@@ -380,6 +525,7 @@ impl AudioEngine {
         let params_cb = channel_params.clone();
         let sample_rate_f = actual_sample_rate as f32;
         let mut biquad = [BiquadState::new(), BiquadState::new()];
+        let mut reverb = [Freeverb::new(sample_rate_f), Freeverb::new(sample_rate_f)];
         let mut process_buf: Vec<f32> =
             Vec::with_capacity(config.buffer_size as usize * in_channels);
 
@@ -395,6 +541,10 @@ impl AudioEngine {
                     lowcut_on: bool,
                     lowcut_freq: f32,
                     gain_lin: f32,
+                    reverb_on: bool,
+                    reverb_room: f32,
+                    reverb_damp: f32,
+                    reverb_wet: f32,
                 }
                 let snap = |idx: usize| -> StripSnapshot {
                     let s = &params_cb.strips[idx];
@@ -403,6 +553,10 @@ impl AudioEngine {
                         lowcut_on: s.lowcut_enabled.load(Ordering::Relaxed),
                         lowcut_freq: s.load_lowcut_freq(),
                         gain_lin: 10.0f32.powf(s.load_gain_db() / 20.0),
+                        reverb_on: s.reverb_enabled.load(Ordering::Relaxed),
+                        reverb_room: f32::from_bits(s.reverb_room_size.load(Ordering::Relaxed)),
+                        reverb_damp: f32::from_bits(s.reverb_damping.load(Ordering::Relaxed)),
+                        reverb_wet: f32::from_bits(s.reverb_wet.load(Ordering::Relaxed)),
                     }
                 };
 
@@ -416,13 +570,24 @@ impl AudioEngine {
                         s * snap.gain_lin
                     };
 
+                let apply_reverb =
+                    |sample: f32, snap: &StripSnapshot, rev: &mut Freeverb| -> f32 {
+                        if !snap.reverb_on {
+                            return sample;
+                        }
+                        rev.set_params(snap.reverb_room, snap.reverb_damp);
+                        let wet = rev.process(sample);
+                        sample * (1.0 - snap.reverb_wet) + wet * snap.reverb_wet
+                    };
+
                 // Extract + process into pre-allocated buffer
                 process_buf.clear();
 
                 if let Some(ch) = source_channel {
                     let p = snap(ch);
                     for frame in data.chunks_exact(in_channels).take(frame_count) {
-                        process_buf.push(apply_dsp(frame[ch], &p, &mut biquad[ch]));
+                        let s = apply_dsp(frame[ch], &p, &mut biquad[ch]);
+                        process_buf.push(apply_reverb(s, &p, &mut reverb[ch]));
                     }
                 } else if merge {
                     let p0 = snap(0);
@@ -430,8 +595,10 @@ impl AudioEngine {
                     let inv = 1.0 / in_channels.min(2) as f32;
                     for frame in data.chunks_exact(in_channels).take(frame_count) {
                         let s0 = apply_dsp(frame[0], &p0, &mut biquad[0]);
+                        let s0 = apply_reverb(s0, &p0, &mut reverb[0]);
                         let s1 = if in_channels > 1 {
-                            apply_dsp(frame[1], &p1, &mut biquad[1])
+                            let s1 = apply_dsp(frame[1], &p1, &mut biquad[1]);
+                            apply_reverb(s1, &p1, &mut reverb[1])
                         } else {
                             s0
                         };
@@ -441,9 +608,11 @@ impl AudioEngine {
                     let p0 = snap(0);
                     let p1 = snap(1);
                     for frame in data.chunks_exact(in_channels).take(frame_count) {
-                        process_buf.push(apply_dsp(frame[0], &p0, &mut biquad[0]));
+                        let s = apply_dsp(frame[0], &p0, &mut biquad[0]);
+                        process_buf.push(apply_reverb(s, &p0, &mut reverb[0]));
                         if in_channels > 1 {
-                            process_buf.push(apply_dsp(frame[1], &p1, &mut biquad[1]));
+                            let s = apply_dsp(frame[1], &p1, &mut biquad[1]);
+                            process_buf.push(apply_reverb(s, &p1, &mut reverb[1]));
                         }
                         for ch_idx in 2..in_channels {
                             process_buf.push(frame[ch_idx]);

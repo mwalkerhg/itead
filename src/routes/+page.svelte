@@ -26,6 +26,10 @@
     lowcut_enabled: boolean;
     lowcut_freq_hz: number;
     phase_invert: boolean;
+    reverb_enabled: boolean;
+    reverb_room_size: number;
+    reverb_damping: number;
+    reverb_wet: number;
   }
 
   const STANDARD_RATES = [44100, 48000, 88200, 96000, 176400, 192000];
@@ -40,10 +44,12 @@
   let mergeToMono: boolean = $state(false);
 
   let ch1Params: ChannelStripParams = $state({
-    gain_db: 0, lowcut_enabled: false, lowcut_freq_hz: 80, phase_invert: false
+    gain_db: 0, lowcut_enabled: false, lowcut_freq_hz: 80, phase_invert: false,
+    reverb_enabled: false, reverb_room_size: 0.5, reverb_damping: 0.5, reverb_wet: 0.3
   });
   let ch2Params: ChannelStripParams = $state({
-    gain_db: 0, lowcut_enabled: false, lowcut_freq_hz: 80, phase_invert: false
+    gain_db: 0, lowcut_enabled: false, lowcut_freq_hz: 80, phase_invert: false,
+    reverb_enabled: false, reverb_room_size: 0.5, reverb_damping: 0.5, reverb_wet: 0.3
   });
 
   let engineRunning: boolean = $state(false);
@@ -259,6 +265,20 @@
             &#x2300; Phase Invert
           </label>
         </div>
+        <div class="strip-control">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={ch1Params.reverb_enabled} />
+            Reverb
+          </label>
+          {#if ch1Params.reverb_enabled}
+            <label>Room: {(ch1Params.reverb_room_size * 100).toFixed(0)}%</label>
+            <input type="range" min={0} max={1} step={0.01} bind:value={ch1Params.reverb_room_size} />
+            <label>Damping: {(ch1Params.reverb_damping * 100).toFixed(0)}%</label>
+            <input type="range" min={0} max={1} step={0.01} bind:value={ch1Params.reverb_damping} />
+            <label>Wet: {(ch1Params.reverb_wet * 100).toFixed(0)}%</label>
+            <input type="range" min={0} max={1} step={0.01} bind:value={ch1Params.reverb_wet} />
+          {/if}
+        </div>
       </div>
     {/if}
 
@@ -284,6 +304,20 @@
             <input type="checkbox" bind:checked={ch2Params.phase_invert} />
             &#x2300; Phase Invert
           </label>
+        </div>
+        <div class="strip-control">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={ch2Params.reverb_enabled} />
+            Reverb
+          </label>
+          {#if ch2Params.reverb_enabled}
+            <label>Room: {(ch2Params.reverb_room_size * 100).toFixed(0)}%</label>
+            <input type="range" min={0} max={1} step={0.01} bind:value={ch2Params.reverb_room_size} />
+            <label>Damping: {(ch2Params.reverb_damping * 100).toFixed(0)}%</label>
+            <input type="range" min={0} max={1} step={0.01} bind:value={ch2Params.reverb_damping} />
+            <label>Wet: {(ch2Params.reverb_wet * 100).toFixed(0)}%</label>
+            <input type="range" min={0} max={1} step={0.01} bind:value={ch2Params.reverb_wet} />
+          {/if}
         </div>
       </div>
     {/if}
