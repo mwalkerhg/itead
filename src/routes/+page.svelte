@@ -1,66 +1,34 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
-
-  interface DeviceConfigInfo {
-    channels: number;
-    min_sample_rate: number;
-    max_sample_rate: number;
-    sample_format: string;
-  }
-
-  interface DeviceInfo {
-    name: string;
-    is_default: boolean;
-    configs: DeviceConfigInfo[];
-  }
-
-  interface RecordingResult {
-    path: string;
-    duration_secs: number;
-    total_samples: number;
-  }
-
-  interface ChannelStripParams {
-    gain_db: number;
-    lowcut_enabled: boolean;
-    lowcut_freq_hz: number;
-    phase_invert: boolean;
-    reverb_enabled: boolean;
-    reverb_room_size: number;
-    reverb_damping: number;
-    reverb_wet: number;
-  }
+  import * as api from '$lib/api';
+  import { app, applyProject, buildProjectManifest, getPlayableTracks } from '$lib/state.svelte';
+  import ChannelStrip from '$lib/components/ChannelStrip.svelte';
+  import ProjectBar from '$lib/components/ProjectBar.svelte';
+  import TrackList from '$lib/components/TrackList.svelte';
 
   const STANDARD_RATES = [44100, 48000, 88200, 96000, 176400, 192000];
 
-  let inputDevices: DeviceInfo[] = $state([]);
-  let outputDevices: DeviceInfo[] = $state([]);
-  let selectedInput: string = $state('');
-  let selectedOutput: string = $state('');
-  let sampleRate: number = $state(48000);
-  let bufferSize: number = $state(256);
-  let channelMode: string = $state('both');
-  let mergeToMono: boolean = $state(false);
+  let transparent = $state(false);
 
-  let ch1Params: ChannelStripParams = $state({
-    gain_db: 0, lowcut_enabled: false, lowcut_freq_hz: 80, phase_invert: false,
-    reverb_enabled: false, reverb_room_size: 0.5, reverb_damping: 0.5, reverb_wet: 0.3
-  });
-  let ch2Params: ChannelStripParams = $state({
-    gain_db: 0, lowcut_enabled: false, lowcut_freq_hz: 80, phase_invert: false,
-    reverb_enabled: false, reverb_room_size: 0.5, reverb_damping: 0.5, reverb_wet: 0.3
-  });
+  async function toggleTransparency() {
+    transparent = !transparent;
+    await api.setWindowOpacity(transparent ? 0.75 : 1.0);
+  }
 
-  let engineRunning: boolean = $state(false);
-  let recording: boolean = $state(false);
-  let status: string = $state('Stopped');
-  let error: string = $state('');
-  let lastResult: RecordingResult | null = $state(null);
+  let selectedTrackIndex = $derived(
+    app.currentProject?.tracks.findIndex(t => t.id === app.selectedTrackId) ?? -1
+  );
+
+  let selectedTrack = $derived(
+    selectedTrackIndex >= 0 && app.currentProject
+      ? app.currentProject.tracks[selectedTrackIndex]
+      : null
+  );
 
   let availableSampleRates: number[] = $derived.by(() => {
-    const inputDev = inputDevices.find(d => d.name === selectedInput);
-    const outputDev = outputDevices.find(d => d.name === selectedOutput);
+    if (!selectedTrack) return STANDARD_RATES;
+    const inputDev = app.inputDevices.find(d => d.name === selectedTrack.input_device);
+    const outputDev = app.outputDevices.find(d => d.name === selectedTrack.output_device);
     if (!inputDev || !outputDev) return STANDARD_RATES;
 
     return STANDARD_RATES.filter(rate =>
@@ -69,283 +37,372 @@
     );
   });
 
-  $effect(() => {
-    if (availableSampleRates.length > 0 && !availableSampleRates.includes(sampleRate)) {
-      sampleRate = availableSampleRates.includes(48000) ? 48000 : availableSampleRates[0];
-    }
-  });
+  let hasPlayableTracks = $derived(getPlayableTracks().length > 0);
+  let canRecord = $derived(app.selectedTrackId != null && !app.recording && !app.isPlaying);
+  let canPlay = $derived(hasPlayableTracks && !app.recording && !app.isPlaying);
+  let canStop = $derived(app.recording || app.isPlaying);
 
   onMount(async () => {
     try {
-      const [inputs, outputs] = await invoke<[DeviceInfo[], DeviceInfo[]]>('list_audio_devices');
-      inputDevices = inputs;
-      outputDevices = outputs;
-      selectedInput = inputs.find(d => d.is_default)?.name ?? inputs[0]?.name ?? '';
-      selectedOutput = outputs.find(d => d.is_default)?.name ?? outputs[0]?.name ?? '';
+      const [inputs, outputs] = await api.listAudioDevices();
+      app.inputDevices = inputs;
+      app.outputDevices = outputs;
+
+      const settings = await api.loadAppSettings();
+      app.projectList = await api.listProjects();
+
+      if (settings.last_project) {
+        try {
+          const manifest = await api.openProject(settings.last_project);
+          applyProject(manifest);
+        } catch {
+          // Project may have been deleted
+        }
+      }
     } catch (e) {
-      error = `Failed to list devices: ${e}`;
+      app.error = `Failed to initialize: ${e}`;
     }
   });
 
-  let ch1Timer: ReturnType<typeof setTimeout> | null = null;
-  let ch2Timer: ReturnType<typeof setTimeout> | null = null;
+  let paramTimer: ReturnType<typeof setTimeout> | null = null;
 
-  function sendChannelParams(channel: number, params: ChannelStripParams) {
-    invoke('update_channel_params', { channel, params }).catch(e => {
-      console.error(`Failed to update ch${channel + 1} params:`, e);
-    });
+  $effect(() => {
+    if (app.engineRunning && app.monitoringTrackId != null && app.currentProject) {
+      const track = app.currentProject.tracks.find(t => t.id === app.monitoringTrackId);
+      if (track) {
+        const ch1 = { ...track.channel_strip };
+        const ch2 = { ...track.ch2_strip };
+        const mode = track.channel_mode;
+        if (paramTimer) clearTimeout(paramTimer);
+        paramTimer = setTimeout(() => {
+          if (mode === 'ch1') {
+            api.updateChannelParams(0, ch1).catch(() => {});
+          } else if (mode === 'ch2') {
+            api.updateChannelParams(1, ch2).catch(() => {});
+          } else {
+            api.updateChannelParams(0, ch1).catch(() => {});
+            api.updateChannelParams(1, ch2).catch(() => {});
+          }
+        }, 16);
+      }
+    }
+  });
+
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function debouncedProjectSave() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(async () => {
+      const manifest = buildProjectManifest();
+      if (manifest) {
+        try {
+          await api.saveProject(manifest);
+        } catch {
+          // Silent save failure
+        }
+      }
+    }, 500);
   }
 
   $effect(() => {
-    if (engineRunning) {
-      const p = { ...ch1Params };
-      if (ch1Timer) clearTimeout(ch1Timer);
-      ch1Timer = setTimeout(() => sendChannelParams(0, p), 16);
+    if (app.currentProject) {
+      void JSON.stringify(app.currentProject.tracks);
+      debouncedProjectSave();
     }
   });
 
-  $effect(() => {
-    if (engineRunning) {
-      const p = { ...ch2Params };
-      if (ch2Timer) clearTimeout(ch2Timer);
-      ch2Timer = setTimeout(() => sendChannelParams(1, p), 16);
-    }
-  });
+  function getTrackById(id: number) {
+    return app.currentProject?.tracks.find(t => t.id === id) ?? null;
+  }
 
-  async function startEngine() {
+  async function startEngineForTrack(trackId: number) {
+    const track = getTrackById(trackId);
+    if (!track) return;
+    await api.startEngine({
+      input_device: track.input_device,
+      output_device: track.output_device,
+      sample_rate: track.sample_rate,
+      buffer_size: track.buffer_size,
+      channel_mode: track.channel_mode,
+      merge_to_mono: track.channel_mode === 'both' && track.merge_to_mono,
+    });
+    app.engineRunning = true;
+    app.monitoringTrackId = trackId;
+
+    if (track.channel_mode === 'ch1') {
+      api.updateChannelParams(0, { ...track.channel_strip }).catch(() => {});
+    } else if (track.channel_mode === 'ch2') {
+      api.updateChannelParams(1, { ...track.ch2_strip }).catch(() => {});
+    } else {
+      api.updateChannelParams(0, { ...track.channel_strip }).catch(() => {});
+      api.updateChannelParams(1, { ...track.ch2_strip }).catch(() => {});
+    }
+
+    await api.saveAppSettings({
+      last_project: app.currentProject?.name ?? null,
+      input_device: track.input_device,
+      output_device: track.output_device,
+      sample_rate: track.sample_rate,
+      buffer_size: track.buffer_size,
+    });
+  }
+
+  async function stopCurrentEngine() {
+    if (app.recording) {
+      await api.stopRecording();
+      app.recording = false;
+    }
+    if (app.isPlaying) {
+      await api.stopPlayback();
+      app.isPlaying = false;
+    }
+    await api.stopEngine();
+    app.engineRunning = false;
+    app.monitoringTrackId = null;
+  }
+
+  async function toggleMonitor(trackId: number) {
     try {
-      error = '';
-      await invoke('start_engine', {
-        config: {
-          input_device: selectedInput || null,
-          output_device: selectedOutput || null,
-          sample_rate: sampleRate,
-          buffer_size: bufferSize,
-          channel_mode: channelMode,
-          merge_to_mono: channelMode === 'both' && mergeToMono
+      app.error = '';
+      if (app.monitoringTrackId === trackId) {
+        await stopCurrentEngine();
+        app.status = 'Stopped';
+      } else {
+        if (app.engineRunning) {
+          await stopCurrentEngine();
         }
-      });
-      engineRunning = true;
-      status = 'Passthrough active';
-      sendChannelParams(0, { ...ch1Params });
-      sendChannelParams(1, { ...ch2Params });
+        await startEngineForTrack(trackId);
+        app.selectedTrackId = trackId;
+        app.status = 'Monitoring';
+      }
     } catch (e) {
-      error = `${e}`;
+      app.error = `${e}`;
     }
   }
 
   async function startRecording() {
+    if (!canRecord || app.selectedTrackId == null) return;
     try {
-      error = '';
-      const path = await invoke<string>('start_recording', { path: null });
-      recording = true;
-      status = `Recording to ${path}`;
+      app.error = '';
+      if (!app.engineRunning) {
+        await startEngineForTrack(app.selectedTrackId);
+      } else if (app.monitoringTrackId !== app.selectedTrackId) {
+        await stopCurrentEngine();
+        await startEngineForTrack(app.selectedTrackId);
+      }
+      const playable = getPlayableTracks(app.selectedTrackId);
+      if (playable.length > 0) {
+        await api.startPlayback(playable);
+        app.isPlaying = true;
+      }
+      const path = await api.startRecording();
+      app.recording = true;
+      app.status = `Recording`;
     } catch (e) {
-      error = `${e}`;
+      app.error = `${e}`;
     }
   }
 
-  async function stopEngine() {
+  async function startPlayback() {
+    if (!canPlay) return;
     try {
-      error = '';
-      const result = await invoke<RecordingResult | null>('stop_engine');
-      engineRunning = false;
-      recording = false;
-      lastResult = result ?? null;
-      status = result
-        ? `Saved ${result.path} (${result.duration_secs.toFixed(1)}s)`
-        : 'Stopped';
+      app.error = '';
+      if (!app.engineRunning && app.selectedTrackId != null) {
+        await startEngineForTrack(app.selectedTrackId);
+      }
+      const playable = getPlayableTracks();
+      await api.startPlayback(playable);
+      app.isPlaying = true;
+      app.status = 'Playing';
     } catch (e) {
-      error = `${e}`;
+      app.error = `${e}`;
+    }
+  }
+
+  async function handleStop() {
+    try {
+      app.error = '';
+      if (app.isPlaying) {
+        await api.stopPlayback();
+        app.isPlaying = false;
+      }
+      if (app.recording) {
+        const result = await api.stopRecording();
+        app.recording = false;
+        app.lastResult = result ?? null;
+        if (result && app.currentProject && app.selectedTrackId != null) {
+          const idx = app.currentProject.tracks.findIndex(t => t.id === app.selectedTrackId);
+          if (idx >= 0) {
+            const filename = result.path.split(/[/\\]/).pop() ?? result.path;
+            app.currentProject.tracks[idx].wav_filename = filename;
+            app.currentProject.tracks[idx].duration_secs = result.duration_secs;
+            app.currentProject.tracks[idx].sample_rate = result.sample_rate;
+            app.currentProject.tracks[idx].channels = result.channels;
+            app.currentProject.tracks = [...app.currentProject.tracks];
+          }
+          app.status = `Recorded (${result.duration_secs.toFixed(1)}s)`;
+        } else {
+          app.status = app.engineRunning ? 'Monitoring' : 'Stopped';
+        }
+      } else {
+        app.status = app.engineRunning ? 'Monitoring' : 'Stopped';
+      }
+    } catch (e) {
+      app.error = `${e}`;
     }
   }
 </script>
 
 <main>
-  <h1>ITEAD</h1>
-  <p class="subtitle">Audio Engine</p>
-
-  <section class="devices">
-    <div class="field">
-      <label for="input-device">Input Device</label>
-      <select id="input-device" bind:value={selectedInput} disabled={engineRunning}>
-        {#each inputDevices as device}
-          <option value={device.name}>
-            {device.name}{device.is_default ? ' (default)' : ''}
-          </option>
-        {/each}
-      </select>
+  <div class="header">
+    <div>
+      <h1>ITEAD</h1>
+      <p class="subtitle">Audio Engine</p>
     </div>
+    <button
+      class="btn transparency-btn"
+      class:active={transparent}
+      onclick={toggleTransparency}
+      title={transparent ? 'Disable transparency' : 'Enable transparency'}
+    >
+      {transparent ? '◉' : '◎'}
+    </button>
+  </div>
 
-    <div class="field">
-      <label for="output-device">Output Device</label>
-      <select id="output-device" bind:value={selectedOutput} disabled={engineRunning}>
-        {#each outputDevices as device}
-          <option value={device.name}>
-            {device.name}{device.is_default ? ' (default)' : ''}
-          </option>
-        {/each}
-      </select>
-    </div>
-  </section>
-
-  <section class="config">
-    <div class="field">
-      <label for="sample-rate">Sample Rate</label>
-      <select id="sample-rate" bind:value={sampleRate} disabled={engineRunning}>
-        {#each availableSampleRates as rate}
-          <option value={rate}>{rate} Hz</option>
-        {/each}
-      </select>
-    </div>
-
-    <div class="field">
-      <label for="buffer-size">Buffer Size</label>
-      <select id="buffer-size" bind:value={bufferSize} disabled={engineRunning}>
-        <option value={64}>64</option>
-        <option value={128}>128</option>
-        <option value={256}>256</option>
-        <option value={512}>512</option>
-        <option value={1024}>1024</option>
-      </select>
-    </div>
-
-    <div class="field">
-      <label>Channels</label>
-      <div class="channel-toggle">
-        <button
-          class="ch-btn" class:active={channelMode === 'ch1'}
-          disabled={engineRunning}
-          onclick={() => channelMode = 'ch1'}
-        >Ch 1</button>
-        <button
-          class="ch-btn" class:active={channelMode === 'both'}
-          disabled={engineRunning}
-          onclick={() => channelMode = 'both'}
-        >Both</button>
-        <button
-          class="ch-btn" class:active={channelMode === 'ch2'}
-          disabled={engineRunning}
-          onclick={() => channelMode = 'ch2'}
-        >Ch 2</button>
-      </div>
-    </div>
-
-    {#if channelMode === 'both'}
-      <div class="field checkbox">
-        <label>
-          <input type="checkbox" bind:checked={mergeToMono} disabled={engineRunning} />
-          Merge to mono (both channels in both ears)
-        </label>
-      </div>
-    {/if}
-  </section>
-
-  <section class="channel-strips">
-    {#if channelMode !== 'ch2'}
-      <div class="strip">
-        <h3>Ch 1</h3>
-        <div class="strip-control">
-          <label>Gain: {ch1Params.gain_db.toFixed(1)} dB</label>
-          <input type="range" min={-60} max={12} step={0.1} bind:value={ch1Params.gain_db} />
-        </div>
-        <div class="strip-control">
-          <label class="toggle-label">
-            <input type="checkbox" bind:checked={ch1Params.lowcut_enabled} />
-            Low Cut
-          </label>
-          {#if ch1Params.lowcut_enabled}
-            <label>{ch1Params.lowcut_freq_hz.toFixed(0)} Hz</label>
-            <input type="range" min={20} max={500} step={1} bind:value={ch1Params.lowcut_freq_hz} />
-          {/if}
-        </div>
-        <div class="strip-control">
-          <label class="toggle-label">
-            <input type="checkbox" bind:checked={ch1Params.phase_invert} />
-            &#x2300; Phase Invert
-          </label>
-        </div>
-        <div class="strip-control">
-          <label class="toggle-label">
-            <input type="checkbox" bind:checked={ch1Params.reverb_enabled} />
-            Reverb
-          </label>
-          {#if ch1Params.reverb_enabled}
-            <label>Room: {(ch1Params.reverb_room_size * 100).toFixed(0)}%</label>
-            <input type="range" min={0} max={1} step={0.01} bind:value={ch1Params.reverb_room_size} />
-            <label>Damping: {(ch1Params.reverb_damping * 100).toFixed(0)}%</label>
-            <input type="range" min={0} max={1} step={0.01} bind:value={ch1Params.reverb_damping} />
-            <label>Wet: {(ch1Params.reverb_wet * 100).toFixed(0)}%</label>
-            <input type="range" min={0} max={1} step={0.01} bind:value={ch1Params.reverb_wet} />
-          {/if}
-        </div>
-      </div>
-    {/if}
-
-    {#if channelMode !== 'ch1'}
-      <div class="strip">
-        <h3>Ch 2</h3>
-        <div class="strip-control">
-          <label>Gain: {ch2Params.gain_db.toFixed(1)} dB</label>
-          <input type="range" min={-60} max={12} step={0.1} bind:value={ch2Params.gain_db} />
-        </div>
-        <div class="strip-control">
-          <label class="toggle-label">
-            <input type="checkbox" bind:checked={ch2Params.lowcut_enabled} />
-            Low Cut
-          </label>
-          {#if ch2Params.lowcut_enabled}
-            <label>{ch2Params.lowcut_freq_hz.toFixed(0)} Hz</label>
-            <input type="range" min={20} max={500} step={1} bind:value={ch2Params.lowcut_freq_hz} />
-          {/if}
-        </div>
-        <div class="strip-control">
-          <label class="toggle-label">
-            <input type="checkbox" bind:checked={ch2Params.phase_invert} />
-            &#x2300; Phase Invert
-          </label>
-        </div>
-        <div class="strip-control">
-          <label class="toggle-label">
-            <input type="checkbox" bind:checked={ch2Params.reverb_enabled} />
-            Reverb
-          </label>
-          {#if ch2Params.reverb_enabled}
-            <label>Room: {(ch2Params.reverb_room_size * 100).toFixed(0)}%</label>
-            <input type="range" min={0} max={1} step={0.01} bind:value={ch2Params.reverb_room_size} />
-            <label>Damping: {(ch2Params.reverb_damping * 100).toFixed(0)}%</label>
-            <input type="range" min={0} max={1} step={0.01} bind:value={ch2Params.reverb_damping} />
-            <label>Wet: {(ch2Params.reverb_wet * 100).toFixed(0)}%</label>
-            <input type="range" min={0} max={1} step={0.01} bind:value={ch2Params.reverb_wet} />
-          {/if}
-        </div>
-      </div>
-    {/if}
-  </section>
+  <ProjectBar />
 
   <section class="transport">
-    {#if !engineRunning}
-      <button class="btn start" onclick={startEngine}>Start Engine</button>
-    {:else}
-      {#if !recording}
-        <button class="btn record" onclick={startRecording}>Record</button>
-      {/if}
-      <button class="btn stop" onclick={stopEngine}>Stop</button>
+    <button
+      class="btn record"
+      class:active={app.recording}
+      disabled={!canRecord && !app.recording}
+      onclick={app.recording ? handleStop : startRecording}
+      title={app.recording ? 'Stop Recording' : (app.selectedTrackId == null ? 'Select a track first' : 'Record')}
+    >●</button>
+    <button
+      class="btn play"
+      class:active={app.isPlaying && !app.recording}
+      disabled={!canPlay && !app.isPlaying}
+      onclick={app.isPlaying && !app.recording ? handleStop : startPlayback}
+    >▶</button>
+    <button
+      class="btn stop-btn"
+      disabled={!canStop}
+      onclick={handleStop}
+    >■</button>
+    <span class="status-text">{app.status}</span>
+    {#if app.error}
+      <span class="error-text">{app.error}</span>
     {/if}
   </section>
 
-  <section class="status">
-    <p class="status-text">{status}</p>
-    {#if error}
-      <p class="error">{error}</p>
-    {/if}
-    {#if lastResult}
-      <p class="result">
-        {lastResult.path} — {lastResult.duration_secs.toFixed(1)}s,
-        {lastResult.total_samples.toLocaleString()} samples
-      </p>
-    {/if}
-  </section>
+  <TrackList onmonitor={toggleMonitor} />
+
+  {#if selectedTrack && app.currentProject}
+    <section class="selected-track-strip">
+      <h3>{selectedTrack.name}</h3>
+
+      <div class="track-config">
+        <div class="field">
+          <label for="track-input">Input</label>
+          <select id="track-input" bind:value={selectedTrack.input_device} disabled={app.monitoringTrackId === selectedTrack.id}>
+            <option value={null}>None</option>
+            {#each app.inputDevices as device}
+              <option value={device.name}>
+                {device.name}{device.is_default ? ' (default)' : ''}
+              </option>
+            {/each}
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="track-output">Output</label>
+          <select id="track-output" bind:value={selectedTrack.output_device} disabled={app.monitoringTrackId === selectedTrack.id}>
+            <option value={null}>None</option>
+            {#each app.outputDevices as device}
+              <option value={device.name}>
+                {device.name}{device.is_default ? ' (default)' : ''}
+              </option>
+            {/each}
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="track-rate">Sample Rate</label>
+          <select id="track-rate" bind:value={selectedTrack.sample_rate} disabled={app.monitoringTrackId === selectedTrack.id}>
+            {#each availableSampleRates as rate}
+              <option value={rate}>{rate} Hz</option>
+            {/each}
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="track-buffer">Buffer</label>
+          <select id="track-buffer" bind:value={selectedTrack.buffer_size} disabled={app.monitoringTrackId === selectedTrack.id}>
+            <option value={64}>64</option>
+            <option value={128}>128</option>
+            <option value={256}>256</option>
+            <option value={512}>512</option>
+            <option value={1024}>1024</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Channels</label>
+          <div class="channel-toggle">
+            <button
+              class="ch-btn" class:active={selectedTrack.channel_mode === 'ch1'}
+              disabled={app.monitoringTrackId === selectedTrack.id}
+              onclick={() => { selectedTrack.channel_mode = 'ch1'; }}
+            >Ch 1</button>
+            <button
+              class="ch-btn" class:active={selectedTrack.channel_mode === 'both'}
+              disabled={app.monitoringTrackId === selectedTrack.id}
+              onclick={() => { selectedTrack.channel_mode = 'both'; }}
+            >Both</button>
+            <button
+              class="ch-btn" class:active={selectedTrack.channel_mode === 'ch2'}
+              disabled={app.monitoringTrackId === selectedTrack.id}
+              onclick={() => { selectedTrack.channel_mode = 'ch2'; }}
+            >Ch 2</button>
+          </div>
+        </div>
+
+        {#if selectedTrack.channel_mode === 'both'}
+          <div class="field checkbox">
+            <label>
+              <input type="checkbox" bind:checked={selectedTrack.merge_to_mono} disabled={app.monitoringTrackId === selectedTrack.id} />
+              Merge to mono
+            </label>
+          </div>
+        {/if}
+      </div>
+
+      <div class="track-volume">
+        <label for="track-volume">Volume</label>
+        <input
+          id="track-volume"
+          type="range"
+          min="-60"
+          max="12"
+          step="0.1"
+          bind:value={selectedTrack.volume_db}
+        />
+        <span class="volume-label">{selectedTrack.volume_db.toFixed(1)} dB</span>
+      </div>
+
+      <div class="channel-strips">
+        {#if selectedTrack.channel_mode === 'both'}
+          <ChannelStrip label="Ch 1" bind:params={selectedTrack.channel_strip} />
+          <ChannelStrip label="Ch 2" bind:params={selectedTrack.ch2_strip} />
+        {:else if selectedTrack.channel_mode === 'ch1'}
+          <ChannelStrip label="Ch 1" bind:params={selectedTrack.channel_strip} />
+        {:else}
+          <ChannelStrip label="Ch 2" bind:params={selectedTrack.ch2_strip} />
+        {/if}
+      </div>
+    </section>
+  {/if}
 </main>
 
 <style>
@@ -362,6 +419,13 @@
     padding: 2rem;
   }
 
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 2rem;
+  }
+
   h1 {
     margin: 0;
     font-size: 2rem;
@@ -370,24 +434,149 @@
   }
 
   .subtitle {
-    margin: 0.25rem 0 2rem;
+    margin: 0.25rem 0 0;
     color: #888;
     font-size: 0.85rem;
+  }
+
+  .transparency-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: #16213e;
+    color: #888;
+    font-size: 1.2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1px solid #333;
+  }
+  .transparency-btn:hover {
+    background: #1a2744;
+    color: #e0e0e0;
+  }
+  .transparency-btn.active {
+    background: #e94560;
+    color: #fff;
+    border-color: #e94560;
   }
 
   section {
     margin-bottom: 1.5rem;
   }
 
-  .devices, .config {
+  .transport {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 1.5rem;
+  }
+
+  .status-text {
+    margin-left: 0.5rem;
+    font-size: 0.85rem;
+    color: #888;
+  }
+
+  .error-text {
+    margin-left: 0.5rem;
+    font-size: 0.85rem;
+    color: #e94560;
+  }
+
+  .btn {
+    border: none;
+    border-radius: 4px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+
+  .btn.record {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: #444;
+    color: #e94560;
+    font-size: 1.2rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+  }
+  .btn.record:hover:not(:disabled) {
+    background: #555;
+  }
+  .btn.record.active {
+    background: #e94560;
+    color: #fff;
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+  .btn.record:disabled {
+    opacity: 0.3;
+    cursor: default;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+  }
+
+  .btn.play {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: #444;
+    color: #4caf50;
+    font-size: 1.1rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 0 0 2px;
+  }
+  .btn.play:hover:not(:disabled) {
+    background: #555;
+  }
+  .btn.play.active {
+    background: #4caf50;
+    color: #fff;
+  }
+  .btn.play:disabled {
+    opacity: 0.3;
+    cursor: default;
+  }
+
+  .btn.stop-btn {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: #444;
+    color: #e0e0e0;
+    font-size: 1rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+  }
+  .btn.stop-btn:hover:not(:disabled) {
+    background: #555;
+  }
+  .btn.stop-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+  }
+
+  .track-config {
     display: flex;
     flex-wrap: wrap;
-    gap: 1rem;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
   }
 
   .field {
     flex: 1;
-    min-width: 200px;
+    min-width: 140px;
   }
 
   label {
@@ -465,21 +654,13 @@
     height: 16px;
   }
 
-  .channel-strips {
-    display: flex;
-    gap: 1rem;
-    margin-bottom: 1.5rem;
+  .selected-track-strip {
+    border: 1px solid #e94560;
+    border-radius: 4px;
+    padding: 0.75rem;
   }
 
-  .strip {
-    flex: 1;
-    background: #16213e;
-    border: 1px solid #333;
-    border-radius: 6px;
-    padding: 1rem;
-  }
-
-  .strip h3 {
+  .selected-track-strip h3 {
     margin: 0 0 0.75rem;
     font-size: 0.9rem;
     color: #e94560;
@@ -487,81 +668,32 @@
     letter-spacing: 0.05em;
   }
 
-  .strip-control {
+  .track-volume {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
     margin-bottom: 0.75rem;
   }
 
-  .strip-control:last-child {
-    margin-bottom: 0;
+  .track-volume label {
+    margin: 0;
+    min-width: 50px;
   }
 
-  .strip-control input[type="range"] {
-    width: 100%;
+  .track-volume input[type="range"] {
+    flex: 1;
     accent-color: #e94560;
-    margin-top: 0.25rem;
   }
 
-  .strip-control .toggle-label {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: 0.9rem;
-    color: #e0e0e0;
-    text-transform: none;
-    cursor: pointer;
-  }
-
-  .transport {
-    display: flex;
-    gap: 0.75rem;
-  }
-
-  .btn {
-    padding: 0.65rem 1.5rem;
-    border: none;
-    border-radius: 4px;
-    font-size: 0.95rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-
-  .btn.start {
-    background: #0f3460;
-    color: #e0e0e0;
-  }
-  .btn.start:hover {
-    background: #1a4a7a;
-  }
-
-  .btn.record {
-    background: #e94560;
-    color: #fff;
-  }
-  .btn.record:hover {
-    background: #ff6b81;
-  }
-
-  .btn.stop {
-    background: #333;
-    color: #e0e0e0;
-  }
-  .btn.stop:hover {
-    background: #444;
-  }
-
-  .status-text {
-    font-size: 0.95rem;
+  .volume-label {
+    font-size: 0.8rem;
     color: #aaa;
+    min-width: 60px;
+    text-align: right;
   }
 
-  .error {
-    color: #e94560;
-    font-size: 0.85rem;
-  }
-
-  .result {
-    color: #6c9;
-    font-size: 0.85rem;
+  .channel-strips {
+    display: flex;
+    gap: 1rem;
   }
 </style>
